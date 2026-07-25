@@ -1,0 +1,85 @@
+# ============================================================================
+#  Chris's Twice-Weekly News Digest
+#
+#  This file tells GitHub when to run the digest and what to do.
+#  It must live at:  .github/workflows/digest.yml
+#
+#  >>> EDIT THE TWO LINES MARKED "CHANGE ME" BELOW, and nothing else. <<<
+# ============================================================================
+
+name: News Digest
+
+on:
+  # Runs at 09:17 UTC on Sunday and Thursday.
+  #   Summer (EDT): 5:17 AM Eastern
+  #   Winter (EST): 4:17 AM Eastern
+  # GitHub cron is always UTC and does not follow daylight saving. The odd
+  # minute (:17) is deliberate — round times are GitHub's busiest and get
+  # delayed most.
+  schedule:
+    - cron: "17 9 * * 0,4"
+
+  # Lets you press a button to run it by hand. Keep this.
+  workflow_dispatch:
+
+# Needed so the workflow can save the updated history file back to the repo.
+permissions:
+  contents: write
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+
+    env:
+      # ---------------------- CHANGE ME (1 of 2) ----------------------
+      # The address you verified in SendGrid. Must match EXACTLY.
+      DIGEST_FROM: "you@example.com"
+
+      # ---------------------- CHANGE ME (2 of 2) ----------------------
+      # Where the digest should be delivered.
+      DIGEST_TO: "chris.steeves@introhive.com"
+
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the libraries
+        run: pip install -r requirements.txt
+
+      - name: Research and build the digest
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python build_digest.py
+
+      - name: Email it via SendGrid
+        env:
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+        run: python send.py
+
+      - name: Save a copy you can download
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-html
+          path: digest.html
+          if-no-files-found: warn
+
+      # Committing the updated history does two jobs: it remembers what was
+      # sent, and the commit itself counts as repo activity — which stops
+      # GitHub from auto-disabling this schedule after 60 idle days.
+      - name: Remember what was sent
+        run: |
+          git config user.name "digest-bot"
+          git config user.email "actions@github.com"
+          git add digest_history.json
+          if git diff --staged --quiet; then
+            echo "No history changes to commit."
+          else
+            git commit -m "Digest history for $(date -u +%Y-%m-%d)"
+            git push
+          fi
