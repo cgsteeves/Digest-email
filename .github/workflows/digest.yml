@@ -33,11 +33,11 @@ jobs:
     env:
       # ---------------------- CHANGE ME (1 of 2) ----------------------
       # The address you verified in SendGrid. Must match EXACTLY.
-      DIGEST_FROM: "you@example.com"
+      DIGEST_FROM: "admin@wename.app"
 
       # ---------------------- CHANGE ME (2 of 2) ----------------------
       # Where the digest should be delivered.
-      DIGEST_TO: "chris.steeves@introhive.com"
+      DIGEST_TO: "cgsteeves1@gmail.com"
 
     steps:
       - name: Get the code
