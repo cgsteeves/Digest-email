@@ -279,12 +279,12 @@ def save_history(history, new_stories, today):
     cutoff = (datetime.now(EASTERN) - timedelta(days=HISTORY_KEEP_DAYS)).strftime("%Y-%m-%d")
     before = len(history["sent"])
     history["sent"] = [i for i in history["sent"] if str(i.get("date", "")) >= cutoff]
+    pruned = before - len(history["sent"])
     with open(HISTORY_PATH, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2, ensure_ascii=False)
         f.write("\n")
     print(
-        f"History updated: +{len(new_stories)} added, "
-        f"{before - len(history['sent']) + len(new_stories)} pruned, "
+        f"History updated: +{len(new_stories)} added, {pruned} pruned, "
         f"{len(history['sent'])} total."
     )
 
@@ -565,80 +565,84 @@ def fetch_section(client, section, history, today_str, seen_urls):
 
 FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
 
-RESPONSIVE_CSS = """
-  body { margin:0 !important; padding:0 !important; width:100% !important; }
-  table { border-collapse:collapse !important; }
-  img { max-width:100% !important; height:auto !important; }
-  @media only screen and (max-width:620px) {
-    .shell { width:100% !important; }
-    .pad { padding-left:14px !important; padding-right:14px !important; }
-    .masthead-title { font-size:25px !important; }
-    .headline { font-size:17px !important; }
-    .summary { font-size:15px !important; }
-    .blocktext { font-size:14px !important; }
-    .chip { display:block !important; margin:0 0 6px 0 !important; }
-  }
+# Gmail clips any single email larger than ~102 KB, hiding the tail behind a
+# "View entire message" link. A 52-story digest with fully inlined styles came
+# to ~155 KB — comfortably over. So shared styling lives in classes here and
+# only per-section accent colours and structural bits stay inline. Every major
+# client (Gmail, Apple Mail, Outlook, Yahoo) has supported embedded <style> for
+# years; font-family is still set inline on the outer cell so that even if a
+# client strips <style>, the text renders in the right typeface.
+BASE_CSS = """
+body{margin:0;padding:0;background:#f6f7f9;-webkit-text-size-adjust:100%}
+table{border-collapse:collapse}
+.h{font-size:16px;font-weight:700;color:#111827;line-height:1.4;padding-bottom:7px}
+.s{font-size:14px;color:#333;line-height:1.6;padding-bottom:11px}
+.bt{font-size:13px;color:#374151;line-height:1.6}
+.lb{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;padding-bottom:4px}
+.rd{font-size:13px;font-weight:600;text-decoration:none}
+.wh{background:#f1f5f9;border-radius:6px;padding:11px 13px;margin-bottom:10px}
+.bs{background:#fffbeb;border-radius:6px;padding:11px 13px;margin-bottom:10px}
+.ch{display:inline-block;color:#fff;font-size:13px;font-weight:600;padding:7px 13px;border-radius:16px;margin:0 6px 8px 0;white-space:nowrap}
+.sh{font-size:19px;font-weight:800;padding:22px 0 12px}
+.mt{font-size:32px;font-weight:800;color:#111827;letter-spacing:-.5px}
+.dt{font-size:13px;color:#6b7280;text-transform:uppercase;letter-spacing:1px;padding-top:6px}
+.ft{font-size:12px;color:#9ca3af}
+@media only screen and (max-width:620px){
+.shell{width:100%!important}
+.pd{padding-left:14px!important;padding-right:14px!important}
+.mt{font-size:25px!important}
+.h{font-size:17px!important}
+.s{font-size:15px!important}
+.bt{font-size:14px!important}
+.ch{display:block!important;margin:0 0 6px 0!important}
+}
 """
+
+
+def accent_css():
+    """One tiny rule pair per section instead of a colour on every element."""
+    rules = []
+    for section in SECTIONS:
+        key, colour = section["key"], section["color"]
+        rules.append(f".a-{key}{{color:{colour}}}")
+        rules.append(f".g-{key}{{background:{colour}}}")
+    return "\n".join(rules)
 
 
 def esc(text):
     return htmllib.escape(str(text or ""), quote=True)
 
 
-def render_card(story, color):
-    """One story, as a table so Outlook renders the coloured edge correctly."""
-    rows = [
-        f'<tr><td class="pad" style="padding:16px 18px 6px 18px;">'
-        f'<div class="headline" style="font-family:{FONT};font-size:16px;'
-        f'font-weight:700;color:#111827;line-height:1.4;">{esc(story["headline"])}</div>'
-        f"</td></tr>",
-        f'<tr><td class="pad" style="padding:0 18px 12px 18px;">'
-        f'<div class="summary" style="font-family:{FONT};font-size:14px;'
-        f'color:#333333;line-height:1.6;">{esc(story["summary"])}</div>'
-        f"</td></tr>",
-    ]
+def render_card(story, key, color):
+    """
+    One story card. A single table with a single cell holding stacked divs —
+    far less markup than nesting a table per block, which matters because of
+    Gmail's size limit. bgcolor is an HTML attribute so the white card survives
+    even in a client that ignores CSS.
+    """
+    parts = [f'<div class="h">{esc(story["headline"])}</div>']
+    parts.append(f'<div class="s">{esc(story["summary"])}</div>')
 
     if story.get("why"):
-        rows.append(
-            f'<tr><td class="pad" style="padding:0 18px 10px 18px;">'
-            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
-            f'<tr><td style="background:#f1f5f9;border-radius:6px;padding:11px 13px;">'
-            f'<div style="font-family:{FONT};font-size:11px;font-weight:700;'
-            f'text-transform:uppercase;letter-spacing:0.5px;color:{color};'
-            f'padding-bottom:4px;">Why this matters</div>'
-            f'<div class="blocktext" style="font-family:{FONT};font-size:13px;'
-            f'color:#374151;line-height:1.6;">{esc(story["why"])}</div>'
-            f"</td></tr></table></td></tr>"
+        parts.append(
+            f'<div class="wh"><div class="lb a-{key}">Why this matters</div>'
+            f'<div class="bt">{esc(story["why"])}</div></div>'
         )
-
     if story.get("both_sides"):
-        rows.append(
-            f'<tr><td class="pad" style="padding:0 18px 10px 18px;">'
-            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
-            f'<tr><td style="background:#fffbeb;border-radius:6px;padding:11px 13px;">'
-            f'<div style="font-family:{FONT};font-size:11px;font-weight:700;'
-            f'text-transform:uppercase;letter-spacing:0.5px;color:{color};'
-            f'padding-bottom:4px;">Both sides</div>'
-            f'<div class="blocktext" style="font-family:{FONT};font-size:13px;'
-            f'color:#374151;line-height:1.6;">{esc(story["both_sides"])}</div>'
-            f"</td></tr></table></td></tr>"
+        parts.append(
+            f'<div class="bs"><div class="lb a-{key}">Both sides</div>'
+            f'<div class="bt">{esc(story["both_sides"])}</div></div>'
         )
 
-    rows.append(
-        f'<tr><td class="pad" style="padding:0 18px 16px 18px;">'
-        f'<a href="{esc(story["url"])}" style="font-family:{FONT};font-size:13px;'
-        f'font-weight:600;color:{color};text-decoration:none;">'
-        f'Read at {esc(story["source"])} &rarr;</a></td></tr>'
+    parts.append(
+        f'<a class="rd a-{key}" href="{esc(story["url"])}" style="color:{color}">'
+        f'Read at {esc(story["source"])} &rarr;</a>'
     )
 
     return (
-        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
-        'border="0" style="margin:0 0 12px 0;">'
-        f'<tr><td style="background:#ffffff;border-left:5px solid {color};'
-        'border-radius:6px;">'
-        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
-        + "".join(rows)
-        + "</table></td></tr></table>"
+        '<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:12px">'
+        f'<tr><td bgcolor="#ffffff" class="pd" style="border-left:5px solid {color};'
+        'border-radius:6px;padding:16px 18px">' + "".join(parts) + "</td></tr></table>"
     )
 
 
@@ -646,18 +650,16 @@ def render_html(results, today_display, gaps):
     total = sum(len(v) for v in results.values())
 
     # Index chips. Deliberately NOT links: in-email anchor jumps are unreliable
-    # across clients, so these show what's inside and how much of it.
+    # across clients, so these show what's inside and how much of it — which
+    # also makes a thin or missing section obvious at a glance.
     chips = []
     for section in SECTIONS:
         count = len(results.get(section["key"]) or [])
         if not count:
             continue
         chips.append(
-            f'<span class="chip" style="display:inline-block;background:{section["color"]};'
-            f'color:#ffffff;font-family:{FONT};font-size:13px;font-weight:600;'
-            f'padding:7px 13px;border-radius:16px;margin:0 6px 8px 0;'
-            f'white-space:nowrap;">{section["emoji"]} {esc(section["title"])} '
-            f"({count})</span>"
+            f'<span class="ch g-{section["key"]}" style="background:{section["color"]}">'
+            f'{section["emoji"]} {esc(section["title"])} ({count})</span>'
         )
 
     body = []
@@ -665,54 +667,56 @@ def render_html(results, today_display, gaps):
         stories = results.get(section["key"]) or []
         if not stories:
             continue
+        key, colour = section["key"], section["color"]
         body.append(
-            f'<tr><td class="pad" style="padding:22px 0 12px 0;">'
-            f'<div style="font-family:{FONT};font-size:19px;font-weight:800;'
-            f'color:{section["color"]};">{section["emoji"]} {esc(section["title"])}</div>'
-            f"</td></tr>"
+            f'<tr><td class="sh pd a-{key}" style="color:{colour}">'
+            f'{section["emoji"]} {esc(section["title"])}</td></tr>'
         )
         for story in stories:
-            body.append(f'<tr><td>{render_card(story, section["color"])}</td></tr>')
+            body.append(f"<tr><td>{render_card(story, key, colour)}</td></tr>")
 
     gap_note = ""
     if gaps:
         gap_note = (
-            f'<tr><td class="pad" style="padding:0 0 16px 0;">'
-            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
-            f'<tr><td style="background:#fef2f2;border-left:4px solid #dc2626;'
-            f'border-radius:6px;padding:11px 13px;">'
-            f'<div style="font-family:{FONT};font-size:12px;color:#7f1d1d;'
-            f'line-height:1.5;"><strong>No stories found this run for:</strong> '
-            f'{esc(", ".join(gaps))}.</div></td></tr></table></td></tr>'
+            '<tr><td class="pd" style="padding-bottom:16px">'
+            '<div style="background:#fef2f2;border-left:4px solid #dc2626;'
+            'border-radius:6px;padding:11px 13px;font-size:12px;color:#7f1d1d;'
+            'line-height:1.5"><strong>No stories found this run for:</strong> '
+            f'{esc(", ".join(gaps))}.</div></td></tr>'
         )
+
+    # Hidden preheader: the grey preview line inbox lists show next to the
+    # subject. Without it, clients grab whatever text comes first.
+    preheader = (
+        f'<div style="display:none;max-height:0;overflow:hidden;opacity:0">'
+        f"{total} stories across {len([s for s in SECTIONS if results.get(s['key'])])} "
+        f"sections &mdash; {esc(today_display)}</div>"
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="x-apple-disable-message-reformatting">
 <title>News Digest — {esc(today_display)}</title>
-<style>{RESPONSIVE_CSS}</style>
+<style>{BASE_CSS}{accent_css()}</style>
 </head>
-<body style="margin:0;padding:0;background:#f6f7f9;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f6f7f9;">
-<tr><td align="center" style="padding:18px 10px 44px 10px;">
-<table role="presentation" class="shell" width="820" cellpadding="0" cellspacing="0" border="0" style="width:820px;max-width:820px;">
-
-<tr><td class="pad" style="padding:14px 0 18px 0;border-bottom:3px solid #111827;" align="center">
-<div class="masthead-title" style="font-family:{FONT};font-size:32px;font-weight:800;color:#111827;letter-spacing:-0.5px;">The Twice-Weekly Digest</div>
-<div style="font-family:{FONT};font-size:13px;color:#6b7280;text-transform:uppercase;letter-spacing:1px;padding-top:6px;">{esc(today_display)}</div>
+<body style="margin:0;padding:0;background:#f6f7f9">
+{preheader}
+<table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f6f7f9">
+<tr><td align="center" style="padding:18px 10px 44px">
+<table class="shell" width="820" cellpadding="0" cellspacing="0" border="0" style="width:820px;max-width:820px;font-family:{FONT}">
+<tr><td class="pd" style="padding:14px 0 18px;border-bottom:3px solid #111827" align="center">
+<div class="mt">The Twice-Weekly Digest</div>
+<div class="dt">{esc(today_display)}</div>
 </td></tr>
-
-<tr><td class="pad" style="padding:18px 0 10px 0;" align="center">{"".join(chips)}</td></tr>
+<tr><td class="pd" style="padding:18px 0 10px" align="center">{"".join(chips)}</td></tr>
 {gap_note}
 {"".join(body)}
-
-<tr><td class="pad" style="padding:26px 0 0 0;" align="center">
-<div style="font-family:{FONT};font-size:12px;color:#9ca3af;">Generated automatically &middot; {total} stories &middot; {esc(today_display)}</div>
+<tr><td class="pd" style="padding-top:26px" align="center">
+<div class="ft">Generated automatically &middot; {total} stories &middot; {esc(today_display)}</div>
 </td></tr>
-
 </table>
 </td></tr></table>
 </body>
