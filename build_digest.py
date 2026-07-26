@@ -4,9 +4,10 @@ build_digest.py — generates Chris's twice-weekly news digest.
 
 WHAT THIS DOES (plain English):
   1. Reads digest_history.json to see what was already sent before.
-  2. For each of the 9 sections, asks Claude to research fresh stories using
-     live web search, avoiding anything already in the history.
-  3. Renders all the stories into a styled HTML page (digest.html).
+  2. For each section, asks Claude to research fresh stories using live web
+     search, avoiding anything already in the history. Large sections are split
+     into smaller requests so a single oversized reply can't fail.
+  3. Renders all the stories into an email-safe HTML page (digest.html).
   4. Updates digest_history.json with the new stories and prunes old entries.
 
 You should not need to edit this file to use it. The things you MIGHT want to
@@ -18,6 +19,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -33,8 +35,16 @@ EASTERN = ZoneInfo("America/Toronto")
 # Change to "claude-opus-5" for higher quality at higher cost.
 MODEL = os.environ.get("DIGEST_MODEL", "claude-sonnet-5")
 
-# How many web searches Claude may run per section.
-MAX_SEARCHES_PER_SECTION = 8
+# How many web searches Claude may run per request. Lower this to cut cost —
+# it is the single biggest lever on your API bill.
+MAX_SEARCHES = 8
+
+# Ceiling on how much Claude may write per request. Generous, because a reply
+# cut off mid-sentence produces broken JSON and loses the whole section.
+MAX_TOKENS = 20000
+
+# How many times to retry a request that comes back unparseable.
+MAX_ATTEMPTS = 3
 
 # Keep history entries for this many days, then forget them.
 HISTORY_KEEP_DAYS = 60
@@ -42,15 +52,53 @@ HISTORY_KEEP_DAYS = 60
 HISTORY_PATH = "digest_history.json"
 OUTPUT_PATH = "digest.html"
 
-# Sources to avoid because they are paywalled.
 PAYWALLED = (
     "NYT / New York Times, WSJ / Wall Street Journal, Bloomberg, FT / Financial "
     "Times, The Economist, The Globe and Mail, Toronto Star, The Athletic, and "
     "any 'subscribers only' post"
 )
 
-# The 9 sections, in order. Each has a display title, emoji, accent colour,
-# how many stories to aim for, and a description of what belongs in it.
+# Shared taste guidance for the closing grab-bag section.
+WORTH_TASTE = """
+TASTE PROFILE — Chris's interests here map closely to material discussed,
+written or recommended by:
+- Tim Ferriss: tools, tactics, routines, self-experimentation, book and gear
+  recommendations (5-Bullet-Friday style)
+- Andrew Huberman: evidence-based protocols for sleep, exercise, focus, light
+  exposure, stress, nutrition
+- Naval Ravikant: leverage, wealth creation, decision-making, first-principles
+  thinking, philosophy of happiness
+- Chamath Palihapitiya / All-In: macro, markets, venture and tech-business
+  analysis, contrarian economic takes
+- Derek Thompson: data-driven analysis of social and economic trends (housing,
+  abundance, demographics, work, culture)
+- Chris Williamson / Modern Wisdom: psychology, self-improvement,
+  relationships, life philosophy
+Content in the SPIRIT of these figures counts fully. Items do NOT need to be
+authored by them, and do not force their names in. Favour pieces with a durable
+insight, a concrete takeaway or a genuinely novel frame over news-of-the-day
+fluff, listicles or engagement bait.
+
+GUARDRAILS: (a) this space is full of low-evidence supplement, biohacking and
+get-rich content. Prefer primary research or reputable coverage, and where a
+finding is preliminary, small-sample or contested, say so plainly rather than
+repeating a confident claim. (b) These thinkers share a broadly tech-optimist,
+self-optimization worldview — include at least one item from OUTSIDE that
+worldview so the section is not an echo chamber.
+
+A free podcast episode page, show-notes page, YouTube episode or free
+newsletter post is an acceptable link here instead of a news article.
+"""
+
+WORTH_SOURCES = (
+    "NerdWallet, Investopedia, Morningstar, CBC/CTV business, Outside, "
+    "Runner's World (free), Examine, AP/Reuters travel, The Points Guy, "
+    "Atlas Obscura, The Beaverton, The Onion, McSweeney's, Aeon, Nautilus, "
+    "Smithsonian, free Substack posts, free podcast episode pages"
+)
+
+# Each section may define "requests": several smaller asks instead of one big
+# one. Smaller replies are far less likely to be truncated or malformed.
 SECTIONS = [
     {
         "key": "global",
@@ -58,8 +106,11 @@ SECTIONS = [
         "emoji": "\U0001F30D",
         "color": "#2563eb",
         "target": 7,
-        "brief": "Major international news stories (outside Canada).",
         "sources": "AP, Reuters, BBC, Al Jazeera, NPR, The Guardian",
+        "requests": [
+            {"brief": "The most significant international news stories (outside Canada). Focus on the biggest global events.", "target": 4},
+            {"brief": "Further significant international news (outside Canada), DIFFERENT from the biggest headline events — second-tier but still notable world news, including from Asia, Africa, Latin America or Europe.", "target": 3},
+        ],
     },
     {
         "key": "canadian",
@@ -67,8 +118,14 @@ SECTIONS = [
         "emoji": "\U0001F341",
         "color": "#dc2626",
         "target": 5,
-        "brief": "National Canadian news.",
-        "sources": "CBC, CTV, Global News, AP, Reuters",
+        "brief": (
+            "National Canadian news: federal politics, the economy, and stories "
+            "of country-wide significance. This section must not be empty — "
+            "Canadian national news always exists, so search several angles "
+            "(federal government, Parliament, economy, provinces, courts, "
+            "immigration, health care, energy) until you have items."
+        ),
+        "sources": "CBC, CTV, Global News, AP, Reuters, National Post (free articles)",
     },
     {
         "key": "ottawa",
@@ -139,52 +196,42 @@ SECTIONS = [
         "emoji": "✨",
         "color": "#db2777",
         "target": 10,
-        "brief": (
-            "A deliberately eclectic closing grab bag, spanning: personal finance "
-            "and investing; personal fitness, health and longevity; consumer and "
-            "interesting tech; travel (destinations, airlines, points/loyalty, trip "
-            "ideas); satire and humour; and any other genuinely interesting news, "
-            "longreads, culture or curiosities. Aim for VARIETY across those themes "
-            "(roughly 1-3 items per theme), not 10 items of one kind.\n\n"
-            "TASTE PROFILE — Chris's interests here map closely to material "
-            "discussed, written or recommended by:\n"
-            "- Tim Ferriss: tools, tactics, routines, self-experimentation, book "
-            "and gear recommendations (5-Bullet-Friday style)\n"
-            "- Andrew Huberman: evidence-based protocols for sleep, exercise, "
-            "focus, light exposure, stress, nutrition\n"
-            "- Naval Ravikant: leverage, wealth creation, decision-making, "
-            "first-principles thinking, philosophy of happiness\n"
-            "- Chamath Palihapitiya / All-In: macro, markets, venture and "
-            "tech-business analysis, contrarian economic takes\n"
-            "- Derek Thompson: data-driven analysis of social and economic trends "
-            "(housing, abundance, demographics, work, culture)\n"
-            "- Chris Williamson / Modern Wisdom: psychology, self-improvement, "
-            "relationships, life philosophy\n"
-            "Content in the SPIRIT of these figures counts fully. Items do NOT need "
-            "to be authored by them, and do not force their names in. Favour pieces "
-            "with a durable insight, a concrete takeaway, or a genuinely novel "
-            "frame over news-of-the-day fluff, listicles or engagement bait.\n\n"
-            "TWO GUARDRAILS: (a) this space is full of low-evidence supplement, "
-            "biohacking and get-rich content. Prefer primary research or reputable "
-            "coverage, and where a finding is preliminary, small-sample or "
-            "contested, say so plainly rather than repeating a confident claim. "
-            "(b) These thinkers share a broadly tech-optimist, self-optimization "
-            "worldview. Include at least one or two items per run from OUTSIDE that "
-            "worldview so the section is not an echo chamber.\n\n"
-            "Satire items MUST be obviously identified as satire in the summary so "
-            "they can never be mistaken for real reporting.\n\n"
-            "For THIS SECTION ONLY, a free podcast episode page, show-notes page, "
-            "YouTube episode or free newsletter post is an acceptable link instead "
-            "of a news article."
-        ),
-        "sources": (
-            "NerdWallet, Investopedia, Morningstar, CBC/CTV business, Outside, "
-            "Runner's World (free), Examine, AP/Reuters travel, The Points Guy, "
-            "Atlas Obscura, The Beaverton, The Onion, McSweeney's, Aeon, Nautilus, "
-            "Smithsonian, free Substack posts, free podcast episode pages"
-        ),
+        "sources": WORTH_SOURCES,
+        # Split in two so the themes are guaranteed spread AND neither reply is
+        # large enough to risk truncation.
+        "requests": [
+            {
+                "brief": (
+                    "An eclectic mix covering THREE themes, roughly 1-2 items each: "
+                    "(1) personal finance and investing, (2) personal fitness, health "
+                    "and longevity, (3) consumer or otherwise interesting technology."
+                    + WORTH_TASTE
+                ),
+                "target": 5,
+            },
+            {
+                "brief": (
+                    "An eclectic mix covering THREE themes, roughly 1-2 items each: "
+                    "(1) travel — destinations, airlines, points and loyalty, trip "
+                    "ideas, (2) satire and humour, which MUST be obviously identified "
+                    "as satire in the summary so it can never be mistaken for real "
+                    "reporting, (3) any other genuinely interesting longread, culture "
+                    "piece or curiosity."
+                    + WORTH_TASTE
+                ),
+                "target": 5,
+            },
+        ],
     },
 ]
+
+
+def section_requests(section):
+    """Normalise a section into a list of individual asks."""
+    if section.get("requests"):
+        return section["requests"]
+    return [{"brief": section["brief"], "target": section["target"]}]
+
 
 # ---------------------------------------------------------------------------
 # HISTORY (deduplication)
@@ -192,7 +239,6 @@ SECTIONS = [
 
 
 def load_history():
-    """Read the list of previously sent stories. Missing file = empty history."""
     if not os.path.exists(HISTORY_PATH):
         return {"sent": []}
     try:
@@ -207,21 +253,20 @@ def load_history():
 
 
 def recent_history_lines(history, days=30):
-    """Format recent history as text so Claude knows what to avoid."""
     cutoff = (datetime.now(EASTERN) - timedelta(days=days)).strftime("%Y-%m-%d")
-    lines = []
-    for item in history.get("sent", []):
-        if str(item.get("date", "")) >= cutoff:
-            lines.append(f"- [{item.get('category','?')}] {item.get('headline','')} ({item.get('url','')})")
+    lines = [
+        f"- [{i.get('category','?')}] {i.get('headline','')} ({i.get('url','')})"
+        for i in history.get("sent", [])
+        if str(i.get("date", "")) >= cutoff
+    ]
     return "\n".join(lines) if lines else "(nothing sent recently)"
 
 
 def all_history_urls(history):
-    return {item.get("url", "").strip() for item in history.get("sent", []) if item.get("url")}
+    return {i.get("url", "").strip() for i in history.get("sent", []) if i.get("url")}
 
 
 def save_history(history, new_stories, today):
-    """Add this run's stories, drop anything older than HISTORY_KEEP_DAYS."""
     for category, story in new_stories:
         history["sent"].append(
             {
@@ -231,16 +276,17 @@ def save_history(history, new_stories, today):
                 "url": story["url"],
             }
         )
-
     cutoff = (datetime.now(EASTERN) - timedelta(days=HISTORY_KEEP_DAYS)).strftime("%Y-%m-%d")
     before = len(history["sent"])
     history["sent"] = [i for i in history["sent"] if str(i.get("date", "")) >= cutoff]
-    pruned = before - len(history["sent"])
-
     with open(HISTORY_PATH, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2, ensure_ascii=False)
         f.write("\n")
-    print(f"History updated: +{len(new_stories)} added, {pruned} pruned, {len(history['sent'])} total.")
+    print(
+        f"History updated: +{len(new_stories)} added, "
+        f"{before - len(history['sent']) + len(new_stories)} pruned, "
+        f"{len(history['sent'])} total."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -269,28 +315,31 @@ STORY_RULES = """FOR EACH STORY, produce these fields:
 - "source": the publication name for the link, e.g. "CBC News", "Reuters".
 
 Write in plain prose. Do not use markdown, asterisks or HTML tags in any field.
+Do not use literal newlines inside a JSON string value.
 """
 
 
-def build_section_prompt(section, history, today_str):
-    return f"""You are researching one section of Chris's twice-weekly news digest for {today_str}.
+def build_prompt(section, request, history, today_str, retry_note=""):
+    return f"""You are researching part of Chris's twice-weekly news digest for {today_str}.
 
 SECTION: {section['title']}
-WHAT BELONGS HERE: {section['brief']}
-TARGET: {section['target']} stories.
+WHAT BELONGS HERE: {request['brief']}
+TARGET: {request['target']} stories.
 PREFERRED SOURCES: {section['sources']}
 AVOID THESE PAYWALLED SOURCES: {PAYWALLED}
 
 RECENCY: Prefer stories from the last 4-5 days. If you cannot find enough fresh
-items, you may widen the window somewhat. It is far better to return FEWER
-stories than the target than to pad with stale or duplicate items.
+items, widen the window somewhat rather than returning nothing. It is better to
+return fewer strong stories than to pad with stale or duplicate items — but an
+empty result is the worst outcome, so keep searching different angles until you
+have at least some.
 
 ALREADY SENT — DO NOT REPEAT ANY OF THESE, and do not send a different article
 about the same underlying event or topic:
 {recent_history_lines(history)}
 
 {STORY_RULES}
-
+{retry_note}
 Use web search to find and verify every story and link. Then reply with ONLY a
 JSON array of story objects and nothing else — no preamble, no explanation, no
 markdown code fences. Example shape:
@@ -301,69 +350,116 @@ markdown code fences. Example shape:
 """
 
 
+def scan_json_objects(text):
+    """
+    Walk the text and pull out every complete, balanced {...} object.
+
+    This is the workhorse that makes the digest resilient. It survives:
+      - conversational preamble before the JSON ("Now I have five stories...")
+      - trailing commentary after it
+      - markdown code fences
+      - a reply TRUNCATED mid-way: every story that finished is recovered,
+        and only the incomplete final one is lost
+      - one malformed story among many: the rest still come through
+
+    Braces inside string values (and escaped quotes) are tracked correctly, so
+    a headline containing { or " does not confuse the scan.
+    """
+    objects = []
+    depth = 0
+    start = None
+    in_string = False
+    escaped = False
+
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    chunk = text[start : index + 1]
+                    try:
+                        parsed = json.loads(chunk)
+                        if isinstance(parsed, dict):
+                            objects.append(parsed)
+                    except json.JSONDecodeError:
+                        pass  # skip this one, keep scanning
+                    start = None
+
+    return objects
+
+
 def extract_json_array(text):
-    """Pull a JSON array out of the model's reply, tolerating stray wrapping."""
+    """
+    Get a list of story dicts out of the reply.
+
+    Tries a clean whole-array parse first (the happy path), then falls back to
+    scanning for individual complete objects, which recovers partial replies.
+    Returns None only when there is genuinely nothing usable.
+    """
+    if not text:
+        return None
     text = text.strip()
-    # Strip markdown fences if present.
+
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL)
     if fence:
         text = fence.group(1).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+
+    # Happy path: a well-formed array, optionally wrapped in prose.
+    candidates = [text]
     start, end = text.find("["), text.rfind("]")
     if start != -1 and end > start:
-        try:
-            return json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            pass
+        candidates.append(text[start : end + 1])
+
+    for candidate in candidates:
+        for attempt in (candidate, re.sub(r",\s*([\]}])", r"\1", candidate)):
+            try:
+                parsed = json.loads(attempt)
+                if isinstance(parsed, list):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+
+    # Fallback: salvage whatever complete objects exist.
+    salvaged = scan_json_objects(text)
+    if salvaged:
+        print(f"      (salvaged {len(salvaged)} complete stories from a partial reply)")
+        return salvaged
+
     return None
 
 
-def fetch_section(client, section, history, today_str, seen_urls):
-    """Ask Claude for one section's stories. Returns a list (possibly empty)."""
-    print(f"\n--- {section['title']} (target {section['target']}) ---")
-    try:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=16000,
-            messages=[{"role": "user", "content": build_section_prompt(section, history, today_str)}],
-            tools=[
-                {
-                    "type": "web_search_20250305",
-                    "name": "web_search",
-                    "max_uses": MAX_SEARCHES_PER_SECTION,
-                }
-            ],
-        )
-    except Exception as exc:  # noqa: BLE001 - one bad section shouldn't kill the run
-        print(f"  ERROR calling the API: {exc}")
-        return []
-
-    text = "".join(block.text for block in response.content if getattr(block, "type", "") == "text")
-    stories = extract_json_array(text)
-    if not isinstance(stories, list):
-        print("  ERROR: could not parse JSON from the reply. Skipping this section.")
-        print(f"  First 300 chars of reply: {text[:300]!r}")
-        return []
-
-    clean = []
-    for story in stories:
+def clean_stories(raw, seen_urls):
+    out = []
+    for story in raw if isinstance(raw, list) else []:
         if not isinstance(story, dict):
             continue
         url = str(story.get("url", "")).strip()
         headline = str(story.get("headline", "")).strip()
-        if not url or not headline:
+        if not url or not headline or not url.lower().startswith("http"):
             continue
         if url in seen_urls:
-            print(f"  skipped duplicate URL: {headline}")
+            print(f"    skipped duplicate URL: {headline[:60]}")
             continue
         seen_urls.add(url)
         both = story.get("both_sides")
         if isinstance(both, str) and both.strip().lower() in ("", "null", "none", "n/a"):
             both = None
-        clean.append(
+        out.append(
             {
                 "headline": headline,
                 "summary": str(story.get("summary", "")).strip(),
@@ -373,39 +469,115 @@ def fetch_section(client, section, history, today_str, seen_urls):
                 "source": str(story.get("source", "")).strip() or "source",
             }
         )
+    return out
 
-    print(f"  got {len(clean)} usable stories")
-    return clean
+
+def fetch_request(client, section, request, history, today_str, seen_urls):
+    """One ask, with retries. Returns a list of cleaned stories."""
+    retry_note = ""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": build_prompt(section, request, history, today_str, retry_note),
+                    }
+                ],
+                tools=[
+                    {
+                        "type": "web_search_20250305",
+                        "name": "web_search",
+                        "max_uses": MAX_SEARCHES,
+                    }
+                ],
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"    attempt {attempt}: API error: {exc}")
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(5 * attempt)
+            continue
+
+        stop = getattr(response, "stop_reason", None)
+        text = "".join(
+            b.text for b in response.content if getattr(b, "type", "") == "text"
+        )
+
+        if stop == "max_tokens":
+            print(f"    attempt {attempt}: reply hit the token ceiling and was cut off.")
+
+        parsed = extract_json_array(text)
+        if parsed is None:
+            print(f"    attempt {attempt}: could not parse JSON (stop_reason={stop}).")
+            print(f"      reply began: {text[:200]!r}")
+            retry_note = (
+                "\nIMPORTANT: your previous reply could not be parsed. Reply with "
+                "ONLY the raw JSON array. No prose before or after it. Keep each "
+                "summary within the stated sentence count so the reply is not "
+                "truncated.\n"
+            )
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(3)
+            continue
+
+        stories = clean_stories(parsed, seen_urls)
+        if not stories:
+            print(f"    attempt {attempt}: parsed fine but produced 0 usable stories.")
+            retry_note = (
+                "\nIMPORTANT: your previous reply contained no usable stories. Search "
+                "harder and more broadly, and make sure every story has a real, "
+                "confirmed, non-paywalled URL.\n"
+            )
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(3)
+            continue
+
+        print(f"    got {len(stories)} stories (asked for {request['target']})")
+        return stories
+
+    print("    GIVING UP on this request after all attempts.")
+    return []
+
+
+def fetch_section(client, section, history, today_str, seen_urls):
+    print(f"\n--- {section['title']} (target {section['target']}) ---")
+    stories = []
+    for index, request in enumerate(section_requests(section), start=1):
+        label = f"  request {index}/{len(section_requests(section))}"
+        print(f"{label}: asking for {request['target']}")
+        stories.extend(
+            fetch_request(client, section, request, history, today_str, seen_urls)
+        )
+    if not stories:
+        print(f"  !! WARNING: {section['title']} produced NO stories.")
+    return stories
 
 
 # ---------------------------------------------------------------------------
-# RENDERING THE HTML
+# RENDERING — email-safe HTML
+# ---------------------------------------------------------------------------
+# Email clients (Gmail, Outlook, Apple Mail) do not reliably support flexbox,
+# CSS grid, or external stylesheets, and many strip <style> blocks entirely.
+# So: table-based layout, styles inlined on every element, fluid widths.
 # ---------------------------------------------------------------------------
 
-CSS = """
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    background: #f6f7f9; color: #1a1a1a; line-height: 1.55; padding: 24px 16px 60px;
+FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+
+RESPONSIVE_CSS = """
+  body { margin:0 !important; padding:0 !important; width:100% !important; }
+  table { border-collapse:collapse !important; }
+  img { max-width:100% !important; height:auto !important; }
+  @media only screen and (max-width:620px) {
+    .shell { width:100% !important; }
+    .pad { padding-left:14px !important; padding-right:14px !important; }
+    .masthead-title { font-size:25px !important; }
+    .headline { font-size:17px !important; }
+    .summary { font-size:15px !important; }
+    .blocktext { font-size:14px !important; }
+    .chip { display:block !important; margin:0 0 6px 0 !important; }
   }
-  .wrap { max-width: 820px; margin: 0 auto; }
-  .masthead { text-align: center; padding: 20px 0 24px; border-bottom: 3px solid #1a1a1a; margin-bottom: 24px; }
-  .masthead h1 { font-size: 34px; letter-spacing: -0.5px; font-weight: 800; }
-  .masthead .date { margin-top: 6px; font-size: 15px; color: #555; text-transform: uppercase; letter-spacing: 1px; }
-  .toc { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-bottom: 32px; }
-  .chip { text-decoration: none; font-size: 13px; font-weight: 600; padding: 6px 12px; border-radius: 999px; color: #fff; white-space: nowrap; }
-  section { margin-bottom: 34px; }
-  .cat-head { font-size: 20px; font-weight: 800; margin-bottom: 14px; }
-  .card { background: #fff; border-radius: 8px; padding: 16px 18px; margin-bottom: 12px; border-left: 5px solid #ccc; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-  .card h3 { font-size: 16px; font-weight: 700; margin-bottom: 8px; }
-  .card p.summary { font-size: 14px; color: #333; margin-bottom: 10px; }
-  .block { border-radius: 6px; padding: 11px 12px; margin-bottom: 10px; }
-  .block .label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
-  .block p { font-size: 13px; color: #374151; }
-  .why { background: #f8fafc; }
-  .sides { background: #fffbeb; }
-  .read { font-size: 13px; font-weight: 600; text-decoration: none; }
-  footer { text-align: center; font-size: 12px; color: #888; margin-top: 40px; }
 """
 
 
@@ -413,63 +585,138 @@ def esc(text):
     return htmllib.escape(str(text or ""), quote=True)
 
 
-def render_html(results, today_display):
-    parts = [
-        "<!DOCTYPE html>",
-        '<html lang="en"><head><meta charset="UTF-8">',
-        '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
-        f"<title>News Digest — {esc(today_display)}</title>",
-        f"<style>{CSS}</style></head><body><div class=\"wrap\">",
-        '<div class="masthead"><h1>The Twice-Weekly Digest</h1>',
-        f'<div class="date">{esc(today_display)}</div></div>',
-        '<nav class="toc">',
+def render_card(story, color):
+    """One story, as a table so Outlook renders the coloured edge correctly."""
+    rows = [
+        f'<tr><td class="pad" style="padding:16px 18px 6px 18px;">'
+        f'<div class="headline" style="font-family:{FONT};font-size:16px;'
+        f'font-weight:700;color:#111827;line-height:1.4;">{esc(story["headline"])}</div>'
+        f"</td></tr>",
+        f'<tr><td class="pad" style="padding:0 18px 12px 18px;">'
+        f'<div class="summary" style="font-family:{FONT};font-size:14px;'
+        f'color:#333333;line-height:1.6;">{esc(story["summary"])}</div>'
+        f"</td></tr>",
     ]
 
-    for section in SECTIONS:
-        if not results.get(section["key"]):
-            continue
-        parts.append(
-            f'<a class="chip" style="background:{section["color"]}" '
-            f'href="#{section["key"]}">{section["emoji"]} {esc(section["title"])}</a>'
+    if story.get("why"):
+        rows.append(
+            f'<tr><td class="pad" style="padding:0 18px 10px 18px;">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
+            f'<tr><td style="background:#f1f5f9;border-radius:6px;padding:11px 13px;">'
+            f'<div style="font-family:{FONT};font-size:11px;font-weight:700;'
+            f'text-transform:uppercase;letter-spacing:0.5px;color:{color};'
+            f'padding-bottom:4px;">Why this matters</div>'
+            f'<div class="blocktext" style="font-family:{FONT};font-size:13px;'
+            f'color:#374151;line-height:1.6;">{esc(story["why"])}</div>'
+            f"</td></tr></table></td></tr>"
         )
-    parts.append("</nav>")
 
+    if story.get("both_sides"):
+        rows.append(
+            f'<tr><td class="pad" style="padding:0 18px 10px 18px;">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
+            f'<tr><td style="background:#fffbeb;border-radius:6px;padding:11px 13px;">'
+            f'<div style="font-family:{FONT};font-size:11px;font-weight:700;'
+            f'text-transform:uppercase;letter-spacing:0.5px;color:{color};'
+            f'padding-bottom:4px;">Both sides</div>'
+            f'<div class="blocktext" style="font-family:{FONT};font-size:13px;'
+            f'color:#374151;line-height:1.6;">{esc(story["both_sides"])}</div>'
+            f"</td></tr></table></td></tr>"
+        )
+
+    rows.append(
+        f'<tr><td class="pad" style="padding:0 18px 16px 18px;">'
+        f'<a href="{esc(story["url"])}" style="font-family:{FONT};font-size:13px;'
+        f'font-weight:600;color:{color};text-decoration:none;">'
+        f'Read at {esc(story["source"])} &rarr;</a></td></tr>'
+    )
+
+    return (
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+        'border="0" style="margin:0 0 12px 0;">'
+        f'<tr><td style="background:#ffffff;border-left:5px solid {color};'
+        'border-radius:6px;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
+        + "".join(rows)
+        + "</table></td></tr></table>"
+    )
+
+
+def render_html(results, today_display, gaps):
+    total = sum(len(v) for v in results.values())
+
+    # Index chips. Deliberately NOT links: in-email anchor jumps are unreliable
+    # across clients, so these show what's inside and how much of it.
+    chips = []
+    for section in SECTIONS:
+        count = len(results.get(section["key"]) or [])
+        if not count:
+            continue
+        chips.append(
+            f'<span class="chip" style="display:inline-block;background:{section["color"]};'
+            f'color:#ffffff;font-family:{FONT};font-size:13px;font-weight:600;'
+            f'padding:7px 13px;border-radius:16px;margin:0 6px 8px 0;'
+            f'white-space:nowrap;">{section["emoji"]} {esc(section["title"])} '
+            f"({count})</span>"
+        )
+
+    body = []
     for section in SECTIONS:
         stories = results.get(section["key"]) or []
         if not stories:
             continue
-        color = section["color"]
-        parts.append(f'<section id="{section["key"]}">')
-        parts.append(
-            f'<div class="cat-head" style="color:{color}">{section["emoji"]} {esc(section["title"])}</div>'
+        body.append(
+            f'<tr><td class="pad" style="padding:22px 0 12px 0;">'
+            f'<div style="font-family:{FONT};font-size:19px;font-weight:800;'
+            f'color:{section["color"]};">{section["emoji"]} {esc(section["title"])}</div>'
+            f"</td></tr>"
         )
         for story in stories:
-            parts.append(f'<div class="card" style="border-left-color:{color}">')
-            parts.append(f'<h3>{esc(story["headline"])}</h3>')
-            parts.append(f'<p class="summary">{esc(story["summary"])}</p>')
-            if story.get("why"):
-                parts.append(
-                    f'<div class="block why"><div class="label" style="color:{color}">'
-                    f"Why this matters</div><p>{esc(story['why'])}</p></div>"
-                )
-            if story.get("both_sides"):
-                parts.append(
-                    f'<div class="block sides"><div class="label" style="color:{color}">'
-                    f"Both sides</div><p>{esc(story['both_sides'])}</p></div>"
-                )
-            parts.append(
-                f'<a class="read" style="color:{color}" href="{esc(story["url"])}">'
-                f'Read at {esc(story["source"])} &rarr;</a>'
-            )
-            parts.append("</div>")
-        parts.append("</section>")
+            body.append(f'<tr><td>{render_card(story, section["color"])}</td></tr>')
 
-    total = sum(len(v) for v in results.values())
-    parts.append(
-        f'<footer>Generated automatically &middot; {total} stories &middot; {esc(today_display)}</footer>'
-    )
-    parts.append("</div></body></html>")
-    return "\n".join(parts)
+    gap_note = ""
+    if gaps:
+        gap_note = (
+            f'<tr><td class="pad" style="padding:0 0 16px 0;">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
+            f'<tr><td style="background:#fef2f2;border-left:4px solid #dc2626;'
+            f'border-radius:6px;padding:11px 13px;">'
+            f'<div style="font-family:{FONT};font-size:12px;color:#7f1d1d;'
+            f'line-height:1.5;"><strong>No stories found this run for:</strong> '
+            f'{esc(", ".join(gaps))}.</div></td></tr></table></td></tr>'
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="x-apple-disable-message-reformatting">
+<title>News Digest — {esc(today_display)}</title>
+<style>{RESPONSIVE_CSS}</style>
+</head>
+<body style="margin:0;padding:0;background:#f6f7f9;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f6f7f9;">
+<tr><td align="center" style="padding:18px 10px 44px 10px;">
+<table role="presentation" class="shell" width="820" cellpadding="0" cellspacing="0" border="0" style="width:820px;max-width:820px;">
+
+<tr><td class="pad" style="padding:14px 0 18px 0;border-bottom:3px solid #111827;" align="center">
+<div class="masthead-title" style="font-family:{FONT};font-size:32px;font-weight:800;color:#111827;letter-spacing:-0.5px;">The Twice-Weekly Digest</div>
+<div style="font-family:{FONT};font-size:13px;color:#6b7280;text-transform:uppercase;letter-spacing:1px;padding-top:6px;">{esc(today_display)}</div>
+</td></tr>
+
+<tr><td class="pad" style="padding:18px 0 10px 0;" align="center">{"".join(chips)}</td></tr>
+{gap_note}
+{"".join(body)}
+
+<tr><td class="pad" style="padding:26px 0 0 0;" align="center">
+<div style="font-family:{FONT};font-size:12px;color:#9ca3af;">Generated automatically &middot; {total} stories &middot; {esc(today_display)}</div>
+</td></tr>
+
+</table>
+</td></tr></table>
+</body>
+</html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +730,10 @@ def main():
 
     now = datetime.now(EASTERN)
     today_iso = now.strftime("%Y-%m-%d")
-    today_display = now.strftime("%A, %B %-d, %Y") if os.name != "nt" else now.strftime("%A, %B %d, %Y")
+    try:
+        today_display = now.strftime("%A, %B %-d, %Y")
+    except ValueError:
+        today_display = now.strftime("%A, %B %d, %Y")
 
     print(f"Building digest for {today_display} using model {MODEL}")
 
@@ -493,26 +743,34 @@ def main():
 
     results = {}
     new_stories = []
+    gaps = []
     for section in SECTIONS:
         stories = fetch_section(client, section, history, today_display, seen_urls)
         results[section["key"]] = stories
+        if not stories:
+            gaps.append(section["title"])
         for story in stories:
             new_stories.append((section["title"], story))
 
+    print("\n=== COVERAGE ===")
+    for section in SECTIONS:
+        got = len(results.get(section["key"]) or [])
+        flag = "  <-- EMPTY" if got == 0 else ""
+        print(f"  {section['title']:32} {got}/{section['target']}{flag}")
+
     total = len(new_stories)
     if total == 0:
-        sys.exit("ERROR: no stories were gathered. Not writing an empty digest.")
+        sys.exit("ERROR: no stories were gathered at all. Not writing an empty digest.")
 
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-        f.write(render_html(results, today_display))
+        f.write(render_html(results, today_display, gaps))
     print(f"\nWrote {OUTPUT_PATH} with {total} stories.")
 
     save_history(history, new_stories, today_iso)
 
-    # Hand the subject line to the next workflow step.
-    step_summary = os.environ.get("GITHUB_ENV")
-    if step_summary:
-        with open(step_summary, "a", encoding="utf-8") as f:
+    github_env = os.environ.get("GITHUB_ENV")
+    if github_env:
+        with open(github_env, "a", encoding="utf-8") as f:
             f.write(f"DIGEST_SUBJECT=Your Twice-Weekly Digest — {today_display}\n")
             f.write(f"DIGEST_COUNT={total}\n")
 
